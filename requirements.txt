@@ -3,3 +3,6 @@ numpy>=1.26.0
 matplotlib>=3.8.0
 plotly>=5.20.0
 pandas>=2.0.0
+
+# Screenshot tooling (docs only — not needed to run the app)
+playwright>=1.44.0
