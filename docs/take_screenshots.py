@@ -18,12 +18,11 @@ Screenshots are written to docs/screenshots/.
 """
 
 import asyncio
-import time
 from pathlib import Path
 
 from playwright.async_api import async_playwright, Page
 
-APP_URL = "http://localhost:8501"
+APP_URL = "http://localhost:8502"
 OUT_DIR = Path(__file__).parent / "screenshots"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -73,13 +72,17 @@ async def select_option(page: Page, label: str, option: str) -> None:
     await page.wait_for_timeout(300)
 
 
-async def click_button(page: Page, label: str) -> None:
-    await page.get_by_role("button", name=label).click()
+async def click_button(page: Page, label: str, force: bool = False) -> None:
+    btn = page.get_by_role("button", name=label)
+    await btn.scroll_into_view_if_needed()
+    await page.wait_for_timeout(200)
+    await btn.click(force=force)
 
 
 async def screenshot(page: Page, name: str) -> None:
     path = OUT_DIR / f"{name}.png"
-    await page.screenshot(path=str(path), full_page=False)
+    # timeout=0 skips the font-loading wait that can stall headless Chrome
+    await page.screenshot(path=str(path), full_page=False, timeout=0)
     print(f"  saved {path.name}")
 
 
@@ -93,51 +96,44 @@ async def tab1_preview(page: Page) -> None:
     await screenshot(page, "tab1_preview")
 
 
-async def tab1_trained(page: Page) -> None:
-    """Tab 1 — train Q-Learning on default 5×5 grid and screenshot result."""
-    print("Tab 1: training Q-Learning agent")
+async def tab1_trained_and_lava(page: Page) -> None:
+    """
+    Tab 1 — single training run on the Lava Field preset.
+    Screenshots:
+      tab1_trained          — policy + value function after training
+      tab1_lava_trajectory  — greedy episode where agent walks into lava
+    """
+    print("Tab 1: training on Lava Field preset")
     await click_tab(page, "Grid World RL")
 
-    # Open the Configuration expander (it auto-closes after training)
-    expander = page.locator("[data-testid='stExpander']").first
-    if await expander.get_by_text("Configuration").is_visible():
-        await expander.click()
-        await page.wait_for_timeout(300)
-
-    await click_button(page, "Train Agent")
-    await wait_for_idle(page, timeout=60_000)
-    await screenshot(page, "tab1_trained")
-
-
-async def tab1_lava(page: Page) -> None:
-    """Tab 1 — Lava Field preset: agent trained then walks into lava."""
-    print("Tab 1: Lava Field trajectory")
-    await click_tab(page, "Grid World RL")
-
-    # Reset any prior training
-    try:
-        await click_button(page, "Reset")
-        await wait_for_idle(page, timeout=5_000)
-    except Exception:
-        pass
-
-    # Open Configuration
-    expander = page.locator("[data-testid='stExpander']").first
-    try:
-        await expander.click()
-        await page.wait_for_timeout(300)
-    except Exception:
-        pass
+    # Configuration expander is open on fresh load (trained=False → expanded=True)
+    await page.wait_for_selector("[data-testid='stExpander']", timeout=8_000)
+    await page.wait_for_timeout(500)
 
     # Select Lava Field preset
     await select_option(page, "Preset", "Lava Field")
+    await page.wait_for_timeout(400)
 
-    # Train
-    await click_button(page, "Train Agent")
+    # Train — use JS click to avoid any header/overlay interception
+    await page.evaluate("""
+        () => {
+            const btn = [...document.querySelectorAll('button')]
+                .find(b => b.innerText.trim() === 'Train Agent');
+            if (btn) btn.click();
+        }
+    """)
     await wait_for_idle(page, timeout=60_000)
+    await screenshot(page, "tab1_trained")
 
-    # Run greedy episode (lava activates at test time)
-    await click_button(page, "Run Greedy Episode")
+    print("Tab 1: Lava Field trajectory")
+    # Run greedy episode — lava is activated at test time
+    await page.evaluate("""
+        () => {
+            const btn = [...document.querySelectorAll('button')]
+                .find(b => b.innerText.trim() === 'Run Greedy Episode');
+            if (btn) btn.click();
+        }
+    """)
     await wait_for_idle(page, timeout=10_000)
     await screenshot(page, "tab1_lava_trajectory")
 
@@ -190,25 +186,29 @@ async def main() -> None:
         context = await browser.new_context(viewport=VIEWPORT)
         page = await context.new_page()
 
-        # Load the app and wait for Streamlit to be ready
-        await page.goto(APP_URL, wait_until="networkidle")
-        await page.wait_for_timeout(2_000)
-
-        # Confirm the app title is visible before proceeding
+        # Load the app — Streamlit renders via WebSocket after initial HTML load
+        await page.goto(APP_URL)
+        # Wait for Streamlit's main content wrapper to exist in the DOM
         try:
-            await page.wait_for_selector("text=IRL Explorer", timeout=15_000)
+            await page.wait_for_selector(
+                "[data-testid='stAppViewContainer']", timeout=20_000
+            )
         except Exception:
-            print("ERROR: Could not find 'IRL Explorer' title. Is the app running?")
+            print("ERROR: Streamlit app container not found. Is the app running?")
             await browser.close()
             return
+        # Give React time to finish rendering
+        await page.wait_for_timeout(3_000)
+        # Confirm the app title rendered
+        title = await page.title()
+        print(f"  page title: {title}")
 
         print("App is ready. Taking screenshots...\n")
 
         await tab1_preview(page)
-        await tab1_trained(page)
-        await tab1_lava(page)      # leaves the Lava Field agent in session state
-        await tab2_ird(page)       # Tab 2 picks up the trained agent automatically
-        await tab3_challenge(page) # Tab 3 also reuses the same agent
+        await tab1_trained_and_lava(page)  # trains on Lava Field, then runs episode
+        await tab2_ird(page)               # Tab 2 picks up the trained agent automatically
+        await tab3_challenge(page)         # Tab 3 also reuses the same agent
 
         await browser.close()
 
